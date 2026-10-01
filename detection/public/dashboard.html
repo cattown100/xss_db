@@ -287,6 +287,7 @@
         <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-sessions" data-tab="sessions">세션<span class="tab-count" id="sessionTabCount">0</span></button>
         <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-auth" data-tab="auth">인증 그룹<span class="tab-count" id="authTabCount">0</span></button>
         <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-ip" data-tab="ip">IP 관찰<span class="tab-count" id="ipTabCount">0</span></button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-xss" data-tab="xss">XSS 탐지<span class="tab-count" id="xssTabCount">0</span></button>
       </nav>
 
       <div class="tab-panel active" id="panel-users" role="tabpanel">
@@ -356,6 +357,23 @@
         <div class="table-wrap"><table><thead><tr>
           <th>IP</th><th>요청</th><th>세션</th><th>후보 클라이언트</th><th>고유 경로</th><th>최근 관찰</th>
         </tr></thead><tbody id="ipRows"></tbody></table></div>
+      </div>
+      <div class="tab-panel" id="panel-xss" role="tabpanel" hidden>
+        <div class="section-head"><div><h2>XSS 탐지 — 확정 악성 / 인시던트</h2><p class="sub">공격으로 확정된 payload는 관찰 후보에서 삭제돼도 이 목록에 보관됩니다. 원문은 미리보기로만 표시합니다.</p></div></div>
+        <div class="table-wrap">
+          <h3 style="margin:14px 20px 6px;">Stored XSS — 확정 악성 <span class="tab-count" id="xssStoredCount">0</span></h3>
+          <table><thead><tr>
+            <th>payload (미리보기)</th><th>심각도</th><th>위험도</th><th>endpoint</th><th>심은 세션</th><th>최근 확정</th><th>상태</th><th>관리</th>
+          </tr></thead><tbody id="xssStoredRows"></tbody></table>
+          <h3 style="margin:24px 20px 6px;">Reflected XSS — 확정 <span class="tab-count" id="xssReflectedCount">0</span></h3>
+          <table><thead><tr>
+            <th>payload (미리보기)</th><th>심각도</th><th>위험도</th><th>endpoint</th><th>보낸 세션</th><th>수집 메모</th><th>상태</th><th>관리</th>
+          </tr></thead><tbody id="xssReflectedRows"></tbody></table>
+          <h3 style="margin:24px 20px 6px;">최근 인시던트 알림 <span class="tab-count" id="xssIncidentCount">0</span></h3>
+          <table><thead><tr>
+            <th>시각</th><th>종류</th><th>심각도</th><th>위험도</th><th>payload (미리보기)</th><th>심은 세션</th><th>읽은 세션</th><th>endpoint</th>
+          </tr></thead><tbody id="xssIncidentRows"></tbody></table>
+        </div>
       </div>
     </section>
   </main>
@@ -1411,6 +1429,83 @@ function updateSummary(userRows, sessions, actors, authGroups, ipEntries) {
   document.getElementById('usersTabCount').textContent = userRows.length.toLocaleString();
 }
 
+function severityTag(sev) {
+  const s = String(sev || '').toLowerCase();
+  const cls = (s === 'critical' || s === 'high') ? 'status-error' : 'status-success';
+  return `<span class="${cls}">${escapeHtml(sev || '—')}</span>`;
+}
+function renderXss(confirmed, incidents) {
+  const cItems = (confirmed && confirmed.items) || [];
+  const iItems = (incidents && incidents.incidents) || [];
+  const cCount = (confirmed && confirmed.count) || 0;
+  const iCount = (incidents && incidents.count) || 0;
+  document.getElementById('xssTabCount').textContent = cCount.toLocaleString();
+  document.getElementById('xssIncidentCount').textContent = iCount.toLocaleString();
+  const xssStored = cItems.filter(x => (x.vulnType || 'stored') === 'stored');
+  const xssReflected = cItems.filter(x => x.vulnType === 'reflected');
+  document.getElementById('xssStoredCount').textContent = xssStored.length.toLocaleString();
+  document.getElementById('xssReflectedCount').textContent = xssReflected.length.toLocaleString();
+  const xssStatusSel = (x) => {
+    const cur = x.status || 'open';
+    const opts = [['open','미처리'],['investigating','조사중'],['resolved','처리완료'],['false_positive','오탐']];
+    return `<select class="xss-status select-input" data-xval="${escapeHtml(x.value)}" style="padding:4px 6px;font-size:12px;width:auto;">` +
+      opts.map(([v,l]) => `<option value="${v}"${v===cur?' selected':''}>${l}</option>`).join('') + `</select>`;
+  };
+  const xssDelBtn = (x) => `<button type="button" class="xss-del link-button" data-xval="${escapeHtml(x.value)}" style="padding:4px 8px;font-size:12px;">삭제</button>`;
+  const xssNoteCell = (x) => `<input type="text" class="xss-note search-input" data-xval="${escapeHtml(x.value)}" value="${escapeHtml(x.note || '')}" placeholder="수집 텍스트 입력" style="width:170px;padding:4px 6px;font-size:12px;display:inline-block;" /><button type="button" class="xss-note-save link-button" data-xval="${escapeHtml(x.value)}" style="padding:4px 8px;font-size:12px;margin-left:4px;">저장</button>`;
+  const xssSess = (x) => x.plantedBySessionId ? `<code>${escapeHtml(String(x.plantedBySessionId).slice(0,8))}</code>` : '—';
+  const xssStoredRow = (x) => `<tr>
+    <td><code>${escapeHtml(x.payloadPreview)}</code></td>
+    <td>${severityTag(x.severity)}</td>
+    <td>${escapeHtml(x.riskScore)}</td>
+    <td>${escapeHtml(x.endpoint || '—')}</td>
+    <td>${xssSess(x)}</td>
+    <td>${escapeHtml(formatTime(Date.parse(x.lastConfirmedAt)))}</td>
+    <td>${xssStatusSel(x)}</td>
+    <td>${xssDelBtn(x)}</td>
+  </tr>`;
+  const xssReflectedRow = (x) => `<tr>
+    <td><code>${escapeHtml(x.payloadPreview)}</code></td>
+    <td>${severityTag(x.severity)}</td>
+    <td>${escapeHtml(x.riskScore)}</td>
+    <td>${escapeHtml(x.endpoint || '—')}</td>
+    <td>${xssSess(x)}</td>
+    <td>${xssNoteCell(x)}</td>
+    <td>${xssStatusSel(x)}</td>
+    <td>${xssDelBtn(x)}</td>
+  </tr>`;
+  const xssEditing = document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('xss-note');
+  if (!xssEditing) {
+    document.getElementById('xssStoredRows').innerHTML = xssStored.map(xssStoredRow).join('') || '<tr><td colspan="8" class="empty">확정된 stored XSS가 없습니다.</td></tr>';
+    document.getElementById('xssReflectedRows').innerHTML = xssReflected.map(xssReflectedRow).join('') || '<tr><td colspan="8" class="empty">확정된 reflected XSS가 없습니다.</td></tr>';
+  }
+  if (!window.__xssAdminWired) {
+    window.__xssAdminWired = true;
+    const xssPost = async (path, body) => { try { const r = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }); return (await r.json()).ok; } catch (_) { return false; } };
+    document.addEventListener('change', async (e) => {
+      const sel = e.target.closest && e.target.closest('.xss-status'); if (!sel) return;
+      const ok = await xssPost('/__detection/api/xss/confirmed/update', { value: sel.dataset.xval, status: sel.value });
+      showToast(ok ? ('상태: ' + sel.options[sel.selectedIndex].text) : '변경 실패');
+    });
+    document.addEventListener('click', async (e) => {
+      const del = e.target.closest && e.target.closest('.xss-del');
+      if (del) { if (!window.confirm('이 항목을 삭제할까요?')) return; const ok = await xssPost('/__detection/api/xss/confirmed/delete', { value: del.dataset.xval }); showToast(ok ? '삭제됨' : '삭제 실패'); if (ok) refresh(); return; }
+      const save = e.target.closest && e.target.closest('.xss-note-save');
+      if (save) { const inp = save.parentElement.querySelector('.xss-note'); const ok = await xssPost('/__detection/api/xss/confirmed/update', { value: save.dataset.xval, note: inp ? inp.value : '' }); showToast(ok ? '메모 저장됨' : '저장 실패'); }
+    });
+  }
+  document.getElementById('xssIncidentRows').innerHTML = iItems.map(x => `<tr>
+    <td>${escapeHtml(formatTime(Date.parse(x.at)))}</td>
+    <td>${escapeHtml(x.kind || '—')}</td>
+    <td>${severityTag(x.severity)}</td>
+    <td>${escapeHtml(x.riskScore)}</td>
+    <td><code>${escapeHtml(x.payloadPreview || '')}</code></td>
+    <td>${x.plantedBySessionId ? `<code>${escapeHtml(String(x.plantedBySessionId).slice(0,8))}</code>` : '—'}</td>
+    <td>${x.readBySessionId ? `<code>${escapeHtml(String(x.readBySessionId).slice(0,8))}</code>` : '—'}</td>
+    <td>${escapeHtml(x.endpoint || '—')}</td>
+  </tr>`).join('') || '<tr><td colspan="8" class="empty">최근 인시던트가 없습니다.</td></tr>';
+}
+
 async function refresh() {
   const responses = await Promise.all([
     fetch('/__detection/api/resolved-actors'), fetch('/__detection/api/sessions'), fetch('/__detection/api/actors'),
@@ -1484,6 +1579,14 @@ async function refresh() {
       <td>${e.actorCandidateCount}</td><td>${e.features.behavior.uniqueNormalizedPaths}</td>
       <td>${escapeHtml(formatTime(e.lastSeen))}</td>
     </tr>`).join('') || '<tr><td colspan="6" class="empty">관찰된 IP가 없습니다.</td></tr>';
+
+  try {
+    const [xssConfirmed, xssIncidents] = await Promise.all([
+      fetch('/__detection/api/xss/confirmed').then(r => r.json()),
+      fetch('/__detection/api/xss/incidents').then(r => r.json()),
+    ]);
+    renderXss(xssConfirmed, xssIncidents);
+  } catch (_) { /* 일시적 통신 오류는 기존 화면 유지 */ }
 
   document.querySelectorAll('tr[data-kind]').forEach(row => {
     row.addEventListener('click', () => openDetail(row.dataset.kind, row.dataset.id));

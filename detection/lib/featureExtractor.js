@@ -141,6 +141,7 @@ function extractStreamFeatures({
   lastSeen,
   sessionChurn,
   deceptionHistory = null,
+  attributedXss = null,
 }) {
   const ordered = [...requests].sort((a, b) => a.ts - b.ts);
   const behaviorRequests = ordered.filter(isBehaviorAnalyzable);
@@ -215,10 +216,17 @@ function extractStreamFeatures({
   const businessLogicCategories = Array.from(new Set(allBlTags));
   const allCsrfTags = attackRequests.flatMap((request) => request.csrfTags || []);
   const csrfCategories = Array.from(new Set(allCsrfTags));
-  const allXssTags = attackRequests.flatMap((request) => request.xssTags || []);
+  // 요청별 xssTags(이 세션이 직접 보낸 reflected 등) + 소급 귀속된 stored XSS(다른 세션이
+  // 심었지만 이 세션이 심은 자로 확인된 것)를 함께 집계한다.
+  const attributed = attributedXss || { tags: [], maxRisk: 0 };
+  const allXssTags = [
+    ...attackRequests.flatMap((request) => request.xssTags || []),
+    ...(attributed.tags || []),
+  ];
   const xssCategories = Array.from(new Set(allXssTags));
   const maxXssRisk = Math.max(
     0,
+    Number(attributed.maxRisk) || 0,
     ...attackRequests.map((request) => Number(request.xssMaxRisk) || 0)
   );
   const crsResults = attackRequests
@@ -339,6 +347,7 @@ function extractFeatures(session) {
     lastSeen: session.lastSeen,
     sessionChurn: 1,
     deceptionHistory: session.deceptionHistory,
+    attributedXss: session.attributedXss,
   });
 }
 

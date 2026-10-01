@@ -1,0 +1,15 @@
+
+# XSS 후보 SQLite DB(로컬 데이터, 커밋 제외)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 백업/임시 파일(커밋 제외)
+.xss_backup_*/
+*.bak
+*.bak2
+*.bak3
+
+# 벤치마크(로컬 전용, 커밋 제외)
+bench/

@@ -249,6 +249,8 @@ function getOrCreateSession(sessionId, ip) {
       firstSeen: Date.now(),
       lastSeen: Date.now(),
       requests: [], // { ts, method, url, status }
+      // 다른 세션이 심은 stored XSS가 이 세션(=심은 자)에서 확인되면 소급 귀속되는 원장.
+      attributedXss: { tags: [], maxRisk: 0, hits: 0, lastEndpoint: null },
       headerSample: null,
       fingerprint: null,
       actorId: null,
@@ -568,6 +570,26 @@ function recordTelemetry(sessionId, ip, payload) {
 
 function getSession(sessionId) {
   return sessions.get(sessionId);
+}
+
+/**
+ * stored XSS가 "읽는 응답"에서 확인됐을 때 점수를 읽은 세션이 아니라 "심은 세션"에
+ * 소급 귀속한다(planter attribution). 심은 세션이 이미 사라졌으면 false.
+ */
+function attributeStoredXss(sessionId, { tags = [], risk = 0, endpoint = null } = {}) {
+  if (!sessionId) return false;
+  const s = sessions.get(sessionId);
+  if (!s) return false;
+  if (!s.attributedXss) {
+    s.attributedXss = { tags: [], maxRisk: 0, hits: 0, lastEndpoint: null };
+  }
+  for (const t of tags) {
+    if (t && !s.attributedXss.tags.includes(t)) s.attributedXss.tags.push(t);
+  }
+  s.attributedXss.maxRisk = Math.max(s.attributedXss.maxRisk, Number(risk) || 0);
+  s.attributedXss.hits += 1;
+  if (endpoint) s.attributedXss.lastEndpoint = endpoint;
+  return true;
 }
 
 function getAllSessions() {
@@ -890,6 +912,7 @@ module.exports = {
   recordRequest,
   recordTelemetry,
   getSession,
+  attributeStoredXss,
   getAllSessions,
   getAllActors,
   getActor,

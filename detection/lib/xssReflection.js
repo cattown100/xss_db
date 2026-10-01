@@ -284,6 +284,7 @@ function analyze(candidates, responseBody, contentType, responseHeaders, storedC
       const storedMeta = {
         storedFromEndpoint: sc.endpoint,
         storedSecondsAgo: Math.round((now - sc.firstSeen) / 100) / 10,
+        plantedBy: sc.plantedBy || null, // 심은 자 신원 → 점수 소급 귀속에 사용
       };
       if (bodyIsHtml) {
         const m = findFragment(frags, responseBody);

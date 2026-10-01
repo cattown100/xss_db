@@ -367,10 +367,56 @@ function prepareRequestObservation(req) {
 }
 
 // Stored XSS 대조용 저장소: 쓰기 요청에서 관찰한 값을 나중 응답과 대조한다.
-const xssCandidateStore = new XssCandidateStore();
+// XSS 후보/확정 저장소: 기본은 SQLite(파일) — 재시작해도 확정 악성 payload가 보존된다.
+// node:sqlite 미지원 환경(예: node 20)이면 자동으로 인메모리로 폴백(서버는 항상 뜬다).
+// 환경변수: XSS_STORE=memory, XSS_DB_PATH=<경로>, XSS_TTL_MS, XSS_MAX_ENTRIES, XSS_MAX_CONFIRMED
+// 저장소 상한/수명(환경변수로 조정 가능). 기본: TTL 24시간, 후보 10,000개, 확정 1,000개.
+const xssTtlMs = Number(process.env.XSS_TTL_MS) || 7 * 24 * 60 * 60 * 1000; // 기본 7일
+const xssMaxEntries = Number(process.env.XSS_MAX_ENTRIES) || 4000; // 측정 기반 균형값(응답당 worst ~56-92ms)
+const xssMaxConfirmed = Number(process.env.XSS_MAX_CONFIRMED) || 1000;
+const xssStoreOpts = { ttlMs: xssTtlMs, maxEntries: xssMaxEntries, maxConfirmed: xssMaxConfirmed };
+let xssCandidateStore;
+(() => {
+  const tag = " \u00b7 TTL " + Math.round(xssTtlMs / 3600000) + "h \u00b7 cap " + xssMaxEntries;
+  if (String(process.env.XSS_STORE || "sqlite").toLowerCase() === "memory") {
+    xssCandidateStore = new XssCandidateStore(xssStoreOpts);
+    console.log("[detection] XSS store: in-memory (XSS_STORE=memory)" + tag);
+    return;
+  }
+  try {
+    const fsMod = require("fs");
+    const pathMod = require("path");
+    const dbPath = process.env.XSS_DB_PATH || pathMod.join(__dirname, "data", "xss-candidates.db");
+    fsMod.mkdirSync(pathMod.dirname(dbPath), { recursive: true });
+    const { XssCandidateStoreSqlite } = require("./lib/xssCandidateStoreSqlite");
+    xssCandidateStore = new XssCandidateStoreSqlite({ dbPath, ...xssStoreOpts });
+    console.log("[detection] XSS store: SQLite(file) -> " + dbPath + tag);
+  } catch (e) {
+    xssCandidateStore = new XssCandidateStore(xssStoreOpts);
+    console.warn("[detection] SQLite 사용 불가 → 인메모리 폴백:", e.message);
+  }
+})();
 // XSS 반영 검사에 넘길 응답 본문 최대 크기(과대 응답은 body 검사 생략, 헤더 검사만).
 const XSS_MAX_BODY_BYTES = Number(process.env.XSS_MAX_BODY_BYTES || 2_000_000);
 const XSS_WRITE_METHODS = new Set(["POST", "PUT", "PATCH"]);
+// 탐지 담당자 알림용 XSS 인시던트 피드(최근 N건, 링버퍼). 대시보드 API로 조회한다.
+const XSS_INCIDENT_MAX = Number(process.env.XSS_INCIDENT_MAX || 500);
+const xssIncidents = [];
+// payload 원문은 그대로 노출하지 않고 짧게 잘라 미리보기만 남긴다.
+function previewPayload(value) {
+  const s = String(value || "");
+  return s.length > 120 ? `${s.slice(0, 120)}…` : s;
+}
+function recordXssIncident(incident) {
+  const entry = { at: new Date().toISOString(), ...incident };
+  xssIncidents.push(entry);
+  if (xssIncidents.length > XSS_INCIDENT_MAX) xssIncidents.shift();
+  console.warn(
+    `[XSS-INCIDENT] kind=${entry.kind} severity=${entry.severity} risk=${entry.riskScore} ` +
+      `planter=${entry.plantedBySessionId || "unknown"} readBy=${entry.readBySessionId || "-"} ` +
+      `endpoint=${entry.endpoint || "-"} payload="${entry.payloadPreview || ""}"`
+  );
+}
 
 // Reflected/Stored XSS: 요청 값이 이 응답에 이스케이프 없이 반영됐는지 검사한다.
 function computeXssDetection(req, responseBuffer, responseHeaders) {
@@ -384,14 +430,105 @@ function computeXssDetection(req, responseBuffer, responseHeaders) {
       responseContentType: responseHeaders && responseHeaders["content-type"],
     };
     if (XSS_WRITE_METHODS.has(method)) {
-      xssCandidateStore.observe(extractXssCandidates(xssReq), normalizePath(req.originalUrl));
+      // 심은 자(planter) 신원을 후보에 함께 저장 → stored로 확인되면 이 세션에 소급 귀속.
+      const plantedBy = { sessionId: req.detectionSessionId || null, ip: req.ip || null };
+      const writeCandidates = extractXssCandidates(xssReq);
+      xssCandidateStore.observe(writeCandidates, normalizePath(req.originalUrl), plantedBy);
+      // 이미 확정된 payload가 다시 심어지면 반영을 기다릴 것 없이 즉시 담당자에게 알린다.
+      for (const c of writeCandidates) {
+        if (xssCandidateStore.isConfirmed(c.value)) {
+          xssCandidateStore.confirm({ ...c, plantedBy, endpoint: normalizePath(req.originalUrl) });
+          recordXssIncident({
+            kind: "known-malicious-reposted",
+            severity: "critical",
+            riskScore: 100,
+            plantedBySessionId: req.detectionSessionId || null,
+            endpoint: normalizePath(req.originalUrl),
+            payloadPreview: previewPayload(c.value),
+          });
+        }
+      }
     }
     const body =
       Buffer.isBuffer(responseBuffer) && responseBuffer.length <= XSS_MAX_BODY_BYTES
         ? responseBuffer.toString("utf8")
         : "";
+    // analyzeXssExchange는 stored로 매칭된 후보를 내부에서 저장소에서 제거한다(detect-once).
     const result = analyzeXssExchange(xssReq, body, responseHeaders || {}, xssCandidateStore);
-    return { tags: result.tags, maxRisk: result.maxRisk };
+
+    // 역할별 귀속: reflected는 이 요청/세션에, stored는 "심은 세션"에 소급 귀속하고
+    // 읽은 세션(피해자 가능)에는 점수를 주지 않는다. 확정 stored는 보관소 승격 + 알림.
+    const readerTags = [];
+    let readerMaxRisk = 0;
+    for (const f of result.findings || []) {
+      if (f.vulnerabilityType !== "stored") {
+        // reflected: 이번 요청이 보낸 payload가 응답에 반영됨 → 이 요청/세션에 점수.
+        readerTags.push(`xss:${f.vulnerabilityType}-${f.severity}`);
+        readerMaxRisk = Math.max(readerMaxRisk, Number(f.riskScore) || 0);
+        // reflected도 "확정 악성"으로 보관(유형=reflected) + 담당자 알림(보낸 자가 공격자).
+        const rFirst = xssCandidateStore.confirm({
+          value: f.value,
+          parameter: f.parameter,
+          severity: f.severity,
+          riskScore: f.riskScore,
+          plantedBy: { sessionId: req.detectionSessionId || null, ip: req.ip || null },
+          endpoint: normalizePath(req.originalUrl),
+          vulnerabilityType: "reflected",
+        });
+        if (rFirst) {
+          recordXssIncident({
+            kind: "reflected-confirmed",
+            severity: f.severity,
+            riskScore: f.riskScore,
+            plantedBySessionId: req.detectionSessionId || null,
+            readBySessionId: req.detectionSessionId || null,
+            endpoint: normalizePath(req.originalUrl),
+            payloadPreview: previewPayload(f.value),
+          });
+        }
+        continue;
+      }
+      const planterSid = f.plantedBy && f.plantedBy.sessionId;
+      const tag = `xss:stored-${f.severity}`;
+      if (planterSid && planterSid === req.detectionSessionId) {
+        readerTags.push(tag);
+        readerMaxRisk = Math.max(readerMaxRisk, Number(f.riskScore) || 0);
+      } else if (planterSid) {
+        const ok = store.attributeStoredXss(planterSid, {
+          tags: [tag],
+          risk: f.riskScore,
+          endpoint: f.storedFromEndpoint,
+        });
+        if (!ok) {
+          readerTags.push(tag);
+          readerMaxRisk = Math.max(readerMaxRisk, Number(f.riskScore) || 0);
+        }
+      } else {
+        readerTags.push(tag);
+        readerMaxRisk = Math.max(readerMaxRisk, Number(f.riskScore) || 0);
+      }
+      const firstConfirm = xssCandidateStore.confirm({
+        value: f.value,
+        parameter: f.parameter,
+        severity: f.severity,
+        riskScore: f.riskScore,
+        plantedBy: f.plantedBy,
+        endpoint: f.storedFromEndpoint,
+        vulnerabilityType: "stored",
+      });
+      if (firstConfirm) {
+        recordXssIncident({
+          kind: "stored-confirmed",
+          severity: f.severity,
+          riskScore: f.riskScore,
+          plantedBySessionId: planterSid || null,
+          readBySessionId: req.detectionSessionId || null,
+          endpoint: f.storedFromEndpoint || null,
+          payloadPreview: previewPayload(f.value),
+        });
+      }
+    }
+    return { tags: [...new Set(readerTags)], maxRisk: readerMaxRisk };
   } catch {
     return { tags: [], maxRisk: 0 };
   }
@@ -574,6 +711,53 @@ app.post("/__detection/telemetry", (req, res) => {
   const ip = getClientIp(req);
   store.recordTelemetry(req.detectionSessionId, ip, req.body || {});
   res.status(204).end();
+});
+
+// 탐지 담당자용: 공격으로 확정된 XSS payload 목록(사라지지 않고 보관되는 증거).
+app.get("/__detection/api/xss/confirmed", (_req, res) => {
+  res.json({
+    count: xssCandidateStore.confirmedSize(),
+    items: xssCandidateStore.confirmedList().map((c) => ({
+      value: c.value,
+      payloadPreview: previewPayload(c.value),
+      parameter: c.parameter,
+      severity: c.severity,
+      riskScore: c.riskScore,
+      vulnType: c.vulnType || "stored",
+      status: c.status || "open",
+      note: c.note || "",
+      plantedBySessionId: c.plantedBy && c.plantedBy.sessionId,
+      endpoint: c.endpoint,
+      firstConfirmedAt: new Date(c.firstConfirmedAt).toISOString(),
+      lastConfirmedAt: new Date(c.lastConfirmedAt).toISOString(),
+      timesConfirmed: c.timesConfirmed,
+    })),
+  });
+});
+
+// 탐지 담당자용: 최근 XSS 인시던트 알림 피드(최신순).
+app.get("/__detection/api/xss/incidents", (_req, res) => {
+  res.json({ count: xssIncidents.length, incidents: [...xssIncidents].reverse() });
+});
+
+// 관리자용: 확정 항목 상태/메모 수정 (status: open|investigating|resolved|false_positive, note: 수집 텍스트)
+app.post("/__detection/api/xss/confirmed/update", express.json({ limit: "256kb" }), (req, res) => {
+  const { value, status, note } = req.body || {};
+  if (!value) return res.status(400).json({ ok: false, error: "value required" });
+  const allowed = new Set(["open", "investigating", "resolved", "false_positive"]);
+  const patch = {};
+  if (status !== undefined) patch.status = allowed.has(status) ? status : "open";
+  if (note !== undefined) patch.note = String(note).slice(0, 2000);
+  const ok = xssCandidateStore.updateConfirmed(value, patch);
+  res.json({ ok });
+});
+
+// 관리자용: 확정 항목 삭제
+app.post("/__detection/api/xss/confirmed/delete", express.json({ limit: "256kb" }), (req, res) => {
+  const { value } = req.body || {};
+  if (!value) return res.status(400).json({ ok: false, error: "value required" });
+  const ok = xssCandidateStore.removeConfirmed(value);
+  res.json({ ok });
 });
 
 app.get("/__detection/api/sessions", (req, res) => {
